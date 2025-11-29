@@ -4,7 +4,7 @@ import random
 from datetime import datetime, timedelta
 
 def generate_test_data():
-    base_dir = r"c:\Dev\documenten-importer\test_data"
+    base_dir = os.path.join(os.getcwd(), "test_data")
     source_dir = os.path.join(base_dir, "source_files")
     output_dir = os.path.join(base_dir, "output_files")
     
@@ -23,18 +23,21 @@ def generate_test_data():
     subjects = ["Verwijsbrief", "Huisartsenbrief", "Behandelovereenkomst", "Toestemmingsformulier", "Intakeverslag"]
     extensions = [".pdf", ".docx", ".png", ".jpg"]
     
-    # Generate 20 records
-    for i in range(1, 21):
-        client_id = random.randint(1, 6) # Client IDs 1-6 like in screenshot
+    # Generate 1000 records
+    for i in range(1, 1001):
+        # Introduce some data errors
+        is_missing_client = random.random() < 0.02
+        is_missing_filename = random.random() < 0.02
+        is_missing_file_on_disk = random.random() < 0.05
+
+        client_id = random.randint(1, 6) if not is_missing_client else None
         dossier_id = 1
-        subject = random.choice(subjects) if random.random() > 0.3 else "" # Some empty subjects
+        subject = random.choice(subjects) if random.random() > 0.3 else "" 
         
-        # Construct filename similar to screenshot: "ID_Subject.ext"
         safe_subject = subject.replace(" ", "_") if subject else "document"
         ext = random.choice(extensions)
-        filename = f"{i}_{safe_subject}{ext}"
+        filename = f"{i}_{safe_subject}{ext}" if not is_missing_filename else None
         
-        # Date
         date_val = datetime(2025, 5, 1) + timedelta(days=i)
         
         data.append({
@@ -46,10 +49,15 @@ def generate_test_data():
             "Datumtijd": date_val
         })
         
-        # Create the dummy file
-        file_path = os.path.join(source_dir, filename)
-        with open(file_path, "w") as f:
-            f.write(f"Dummy content for {filename}")
+        # Create the dummy file only if filename exists and we don't want to simulate a missing file
+        if filename and not is_missing_file_on_disk:
+            file_path = os.path.join(source_dir, filename)
+            # Generate a larger file to test zipping (approx 1.5 MB)
+            # 1.5 MB * 1000 files = ~1.5 GB
+            with open(file_path, "wb") as f:
+                # Write 1.5MB of dummy data
+                f.write(os.urandom(1024 * 1500)) 
+
 
     # Create DataFrame
     df = pd.DataFrame(data)
