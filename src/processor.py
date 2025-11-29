@@ -2,26 +2,59 @@ import os
 import shutil
 import pandas as pd
 import zipfile
+import re
 from datetime import datetime
 from jinja2 import Template
 
 class DocumentProcessor:
-    def __init__(self, mapping_file, source_dir, output_dir, source_col, target_col):
+    def __init__(self, mapping_file, source_dir, output_dir, source_col, target_col, dry_run=False, quarantine=False):
         self.mapping_file = mapping_file
         self.source_dir = source_dir
         self.output_dir = output_dir
         self.source_col = source_col
         self.target_col = target_col
+        self.dry_run = dry_run
+        self.quarantine = quarantine
         self.audit_log = []
         self.stats = {
             "total": 0,
             "success": 0,
             "failed": 0,
+            "skipped": 0,
+            "quarantined": 0,
             "errors": {},
             "client_counts": {}
         }
 
+    def sanitize_filename(self, filename):
+        """Removes illegal characters from filenames."""
+        if not filename:
+            return None
+        # Remove characters invalid in Windows/Unix filenames
+        return re.sub(r'[<>:"/\\|?*]', '', str(filename)).strip()
+
+    def extract_id(self, val):
+        """Attempts to extract a numeric ID from a dirty string."""
+        s = str(val).strip()
+        if s.lower() == 'nan' or s.lower() == 'none' or not s:
+            return None
+        
+        # If it's already a clean number (e.g. 123 or 123.0)
+        if s.replace('.', '', 1).isdigit():
+            if s.endswith(".0"):
+                return s[:-2]
+            return s
+            
+        # Fallback: Regex to find the first sequence of digits
+        match = re.search(r'\d+', s)
+        if match:
+            return match.group(0)
+            
+        return s # Return original if no digits found (maybe it's an alphanumeric ID)
+
     def normalize_val(self, val):
+        # Legacy wrapper, now uses extract_id for IDs or sanitize for names?
+        # Let's keep it simple for now, but use extract_id for ClientIDs specifically in the loop
         s = str(val).strip()
         if s.lower() == 'nan' or s.lower() == 'none' or not s:
             return None
@@ -35,9 +68,12 @@ class DocumentProcessor:
 
         df = pd.read_excel(self.mapping_file)
         
-        # Index files
-        files_on_disk = set(os.listdir(self.source_dir))
-
+        # Index files and folders
+        # We create a map of "normalized_name" -> "real_name"
+        # And also keep a list of all real names for fuzzy search
+        disk_items = os.listdir(self.source_dir)
+        matched_items = set()
+        
         total_rows = len(df)
         
         for index, row in df.iterrows():
@@ -49,8 +85,10 @@ class DocumentProcessor:
             raw_doc_name = row.get(self.source_col)
             raw_client_id = row.get(self.target_col)
             
-            doc_name = self.normalize_val(raw_doc_name)
-            client_id = self.normalize_val(raw_client_id)
+            # Use smarter extraction for Client ID (handles "Client 123" -> "123")
+            client_id = self.extract_id(raw_client_id)
+            # Use sanitization for Doc Name (handles "Doc/Name" -> "DocName")
+            doc_name = self.sanitize_filename(self.normalize_val(raw_doc_name))
             
             log_entry = {
                 "id": row_id,
@@ -61,42 +99,106 @@ class DocumentProcessor:
             }
 
             if not doc_name:
-                self._log_error(log_entry, "Bestandsnaam ontbreekt in Excel")
+                self._log_error(log_entry, "Bestandsnaam ontbreekt of ongeldig in Excel")
                 continue
 
             if not client_id:
-                self._log_error(log_entry, "Cliënt ID ontbreekt in Excel")
+                self._log_error(log_entry, "Cliënt ID ontbreekt of ongeldig in Excel")
                 continue
 
-            if doc_name not in files_on_disk:
-                self._log_error(log_entry, f"Bestand niet gevonden: {doc_name}")
+            # Search Logic
+            found_item = None
+            
+            # 1. Exact Match
+            if doc_name in disk_items:
+                found_item = doc_name
+            else:
+                # 2. Fuzzy Match (contains)
+                # Look for item that contains doc_name
+                # Prefer exact containment
+                matches = [item for item in disk_items if str(doc_name) in item]
+                if len(matches) == 1:
+                    found_item = matches[0]
+                elif len(matches) > 1:
+                    # Ambiguous? Pick first or log warning?
+                    # Let's pick the shortest one (closest match?) or just the first
+                    found_item = matches[0] 
+                    # Maybe log that we did a fuzzy match?
+            
+            if not found_item:
+                self._log_error(log_entry, f"Niet gevonden: {doc_name}")
                 continue
 
+            matched_items.add(found_item)
+
+            # Process Found Item
             try:
                 target_path = os.path.join(self.output_dir, client_id)
-                os.makedirs(target_path, exist_ok=True)
+                if not self.dry_run:
+                    os.makedirs(target_path, exist_ok=True)
                 
-                src_file = os.path.join(self.source_dir, doc_name)
-                dst_file = os.path.join(target_path, doc_name)
+                src_path = os.path.join(self.source_dir, found_item)
                 
-                if os.path.exists(dst_file):
-                     log_entry["status"] = "SKIPPED"
-                     log_entry["message"] = f"Bestand bestaat al in {client_id}"
-                     # Not a failure, but not a fresh success either. Let's count as success for now or separate metric?
-                     # User asked for "Wat is goed gegaan", "Wat is fout gegaan". Skipped is kinda success.
-                     self.stats["success"] += 1
-                else:
-                    shutil.copy2(src_file, dst_file)
-                    log_entry["status"] = "SUCCESS"
-                    log_entry["message"] = f"Gekopieerd naar {client_id}"
+                if os.path.isfile(src_path):
+                    # Scenario 1: Single File
+                    dst_file = os.path.join(target_path, found_item)
+                    if os.path.exists(dst_file) and not self.dry_run:
+                         log_entry["status"] = "SKIPPED"
+                         log_entry["message"] = f"Bestand bestaat al: {found_item}"
+                         self.stats["skipped"] += 1
+                    else:
+                        if not self.dry_run:
+                            shutil.copy2(src_path, dst_file)
+                        log_entry["status"] = "SUCCESS" if not self.dry_run else "DRY_RUN"
+                        log_entry["message"] = f"Bestand {'zou worden' if self.dry_run else ''} gekopieerd: {found_item}"
+                        self.stats["success"] += 1
+                        
+                elif os.path.isdir(src_path):
+                    # Scenario 2: Folder
+                    copied_count = 0
+                    for root, dirs, files in os.walk(src_path):
+                        for file in files:
+                            s_file = os.path.join(root, file)
+                            d_file = os.path.join(target_path, file) # Flattening
+                            
+                            # Handle duplicate names if flattening?
+                            if os.path.exists(d_file) and not self.dry_run:
+                                base, ext = os.path.splitext(file)
+                                d_file = os.path.join(target_path, f"{base}_{row_id}{ext}")
+                            
+                            if not self.dry_run:
+                                shutil.copy2(s_file, d_file)
+                            copied_count += 1
+                            
+                    log_entry["status"] = "SUCCESS" if not self.dry_run else "DRY_RUN"
+                    log_entry["message"] = f"Map {'zou worden' if self.dry_run else ''} verwerkt: {found_item} ({copied_count} bestanden)"
                     self.stats["success"] += 1
-                
+
                 self.stats["client_counts"][client_id] = self.stats["client_counts"].get(client_id, 0) + 1
                 
             except Exception as e:
                 self._log_error(log_entry, f"Systeemfout: {str(e)}")
 
             self.audit_log.append(log_entry)
+
+        # Handle Quarantine (Unmatched files)
+        if self.quarantine and not self.dry_run:
+            quarantine_dir = os.path.join(self.output_dir, "_QUARANTINE")
+            os.makedirs(quarantine_dir, exist_ok=True)
+            
+            unmatched_items = set(disk_items) - matched_items
+            for item in unmatched_items:
+                src = os.path.join(self.source_dir, item)
+                dst = os.path.join(quarantine_dir, item)
+                try:
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dst)
+                    elif os.path.isdir(src):
+                        if os.path.exists(dst):
+                            shutil.rmtree(dst)
+                        shutil.copytree(src, dst)
+                except Exception as e:
+                    print(f"Failed to quarantine {item}: {e}")
 
         self.stats["success_rate"] = (self.stats["success"] / self.stats["total"] * 100) if self.stats["total"] > 0 else 0
         self.stats["top_clients"] = sorted(self.stats["client_counts"].items(), key=lambda item: item[1], reverse=True)[:10]
